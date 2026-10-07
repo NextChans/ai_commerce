@@ -246,28 +246,36 @@ Content-Type: application/json
 
 ## 3. 서버 처리 순서 (구현 가이드: `POST /v1/checkout-sessions`)
 
-```kotlin
+```ts
 // 의사코드 — 트랜잭션 경계와 실패 지점 명시
-fun create(cmd: CreateCheckoutCommand): CheckoutSessionResult {
-    idempotency.claim(cmd.agentId, cmd.idempotencyKey, cmd.requestHash)   // INSERT ON CONFLICT
-        ?.let { return it.replay() }                                       // 완료 응답 재생 or 409/422
+async function createCheckoutSession(cmd: CreateCheckoutCommand): Promise<CheckoutSessionResult> {
+  const claimed = await idempotency.claim(cmd.agentId, cmd.idempotencyKey, cmd.requestHash); // INSERT ON CONFLICT
+  if (claimed.kind === 'replay') return claimed.response;          // 완료 응답 재생 (처리중 409 / 바디 상이 422 는 throw)
 
-    val policy = policyRepo.get(cmd.merchantId, cmd.agentId)
-        .requireCheckoutEnabled()                                          // 403 MERCHANT_NOT_AVAILABLE
+  const policy = await policyRepo.get(cmd.merchantId, cmd.agentId);
+  policy.requireCheckoutEnabled();                                  // 403 MERCHANT_NOT_AVAILABLE
 
-    return tx {
-        val variants = variantRepo.findAllForShare(cmd.variantIds)         // 동일 가맹점/ACTIVE 검증
-        val quote = pricing.quote(variants, cmd.lineItems, cmd.shipping)   // 서버측 재계산
-            .also { it.assertMatches(cmd.expectedPrices) }                 // 409 PRICE_CHANGED
-            .also { policy.assertWithinLimit(it.total) }                   // 422 ORDER_LIMIT_EXCEEDED
+  try {
+    const result = await db.transaction().execute(async (trx) => {
+      const variants = await variantRepo.findActive(trx, cmd.merchantId, cmd.variantIds); // 동일 가맹점/ACTIVE 검증
+      const quote = pricing.quote(variants, cmd.lineItems, cmd.shipping);                  // 서버측 재계산 (bigint)
+      quote.assertMatches(cmd.expectedPrices);                      // 409 PRICE_CHANGED
+      policy.assertWithinLimit(quote.total);                        // 422 ORDER_LIMIT_EXCEEDED
 
-        cmd.lineItems.sortedBy { it.variantId }                            // 데드락 방지: 고정 순서로 락
-            .forEach { inventory.hold(it.variantId, it.quantity) }         // 조건부 UPDATE, 0 row → 409 OUT_OF_STOCK
+      for (const item of [...cmd.lineItems].sort(byVariantId)) {    // 데드락 방지: 고정 순서로 락
+        await inventory.hold(trx, item.variantId, item.quantity);   // 조건부 UPDATE, 0 row → 409 OUT_OF_STOCK
+      }
 
-        val token = CheckoutToken.generate()                               // 256-bit, DB엔 sha256만
-        val session = sessionRepo.insert(quote, cmd, token.hash, ttl = policy.ttl)
-        CheckoutSessionResult(session, token.toUrl())
-    }.also { idempotency.complete(cmd, it) }                               // 실패 시 키 해제(재시도 허용)
+      const token = CheckoutToken.generate();                       // crypto.randomBytes(32), DB엔 sha256만
+      const session = await sessionRepo.insert(trx, { quote, cmd, tokenHash: token.hash, ttl: policy.ttl });
+      return { session, checkoutUrl: token.toUrl() };
+    });
+    await idempotency.complete(cmd, 201, result);
+    return result;
+  } catch (e) {
+    await idempotency.release(cmd);                                 // 실패 시 키 해제(재시도 허용)
+    throw e;
+  }
 }
 ```
 
@@ -277,4 +285,4 @@ fun create(cmd: CreateCheckoutCommand): CheckoutSessionResult {
 2. **PII를 에이전트가 전달하는 경로**: 에이전트 플랫폼이 사용자 주소를 보유한 경우 편의성이 크지만, 개인정보 수집 주체·제3자 제공 고지가 복잡해진다. MVP는 *선택 필드*로 두고 결제 페이지에서 동의와 함께 최종 확정.
 3. **재고 홀드 남용**: 악성/버그 에이전트가 세션을 대량 생성해 재고를 묶을 수 있음 → 에이전트별 `OPEN` 세션 수 상한, variant별 1세션 최대 홀드 수량, 미결제율 모니터링.
 4. **검색 API 스크래핑**: 경쟁사 가격 수집 악용 가능 → 에이전트 계약 기반 발급, 레이트리밋 티어, `available_quantity` 상한 노출.
-5. 다음 단계로 이 명세를 OpenAPI 3.1 로 옮겨 계약 테스트(Spring Cloud Contract / schemathesis)와 MCP tool 정의를 자동 생성하는 것을 권장.
+5. 다음 단계로 이 명세를 OpenAPI 3.1 로 옮겨 계약 테스트(schemathesis)와 MCP tool 정의를 자동 생성하는 것을 권장. `packages/contracts`의 zod 스키마를 단일 소스로 둔다.

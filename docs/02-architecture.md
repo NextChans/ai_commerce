@@ -4,9 +4,11 @@
 
 | 영역 | 선택 | 비고 |
 |---|---|---|
-| Runtime | **Kotlin 2.x + Spring Boot 3.x (JDK 21, Virtual Threads)** | 요구사항은 Node/Python을 권장했으나, 팀 표준·결제 도메인 운영 경험·타입 안정성을 우선. I/O 바운드(PG/OMS/LLM 호출)는 Virtual Threads로 처리. |
-| 구조 | **Modular Monolith** (Gradle 멀티모듈, Hexagonal) | 초기 트래픽·팀 규모 대비 MSA는 과설계. 모듈 경계를 `catalog / checkout / order / ingestion`으로 강제(ArchUnit)하고, 필요 시 배포 단위만 분리. |
-| Ingestion Worker | Kotlin 워커 (+ LLM 호출) | 엑셀/크롤링 파싱·LLM 정규화. 무거운 작업이라 API Pod과 별도 Deployment. |
+| Runtime | **TypeScript + Node.js 22 LTS** (NestJS on Fastify adapter) | 워크로드가 I/O 바운드(PG/OMS/LLM/DB 호출)라 이벤트 루프 모델에 적합. MCP·ACP 공식 SDK가 TS 우선 제공, 가맹점 콘솔(Next.js)과 DTO/zod 스키마 공유. 임베딩·LLM은 호스팅 API 호출이라 Python ML 생태계가 필요 없음 → **단일 언어**로 운영 비용 최소화. NestJS는 모듈/DI 구조로 Hexagonal 경계를 강제하기 쉽다. |
+| 구조 | **Modular Monolith** (pnpm workspace + Turborepo, Hexagonal) | 초기 트래픽·팀 규모 대비 MSA는 과설계. 패키지 경계 `catalog / checkout / order / ingestion`을 `eslint-plugin-boundaries`로 강제하고, 필요 시 배포 단위만 분리. |
+| 검증/계약 | zod (런타임 검증) → OpenAPI 3.1 생성 (`zod-openapi`) | 요청 스키마 하나로 검증·문서·MCP tool 정의를 함께 생성. |
+| DB 접근 | **Kysely** (타입 안전 SQL 빌더) + `node-pg-migrate`(정본 SQL 마이그레이션) | 조건부 UPDATE(재고), `FOR UPDATE SKIP LOCKED`(디스패치 큐), pgvector 연산자 등 SQL 제어가 핵심. Prisma는 부분 인덱스·pgvector·행 잠금 표현이 약해 raw SQL이 늘어남. |
+| Ingestion Worker | 같은 코드베이스의 별도 엔트리포인트 | 엑셀(SheetJS 스트리밍)/크롤링(undici + cheerio, JS 렌더링 필요 시 Playwright) 파싱·LLM 정규화. CPU/메모리 패턴이 달라 API Pod과 별도 Deployment. |
 | DB | **RDS PostgreSQL 16** + pgvector + pg_bigm | OLTP + 벡터 검색 단일 저장소로 시작. Multi-AZ, Read Replica는 카탈로그 검색용. |
 | Cache / Rate limit | **ElastiCache Redis (cluster mode)** | 검색 결과·상품 상세 캐시, 토큰 버킷 레이트리밋, 세션 토큰 → 세션 ID 매핑. |
 | 메시징 | **SQS (Standard + DLQ)**, FIFO는 주문 라우팅 큐에만 | 주문 단위 순서 보장이 필요한 곳만 FIFO(`MessageGroupId=orderId`). |
@@ -25,7 +27,7 @@
                                  ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
 │  AWS WAF ─▶ ALB ─▶ EKS                                                                       │
-│ ┌──────────────────────────────── agent-gateway (Spring Boot) ─────────────────────────────┐ │
+│ ┌──────────────────────────────── agent-gateway (NestJS/Fastify) ──────────────────────────┐ │
 │ │  [Edge]  AuthN/Z(scope) · Rate Limit(Redis) · Idempotency · Request Signing · Audit       │ │
 │ │  [Protocol Adapters]  REST v1  │  ACP adapter  │  MCP server (tools: search, checkout)    │ │
 │ │ ┌───────────────┐  ┌────────────────────┐  ┌──────────────────────┐                      │ │
@@ -64,18 +66,23 @@ External:  PG사 ──(webhook)──▶ webhook-receiver        order-dispatch
            가맹점 OMS ──(재고/주문상태 webhook 또는 폴링)──▶ agent-gateway(catalog/order)
 ```
 
-### 모듈 경계 (Gradle)
+### 모듈 경계 (pnpm workspace)
 ```
-:app:agent-gateway       // API 진입점, 프로토콜 어댑터(REST/ACP/MCP)
-:app:webhook-receiver    // 퍼블릭 엔드포인트 분리 (공격면/스케일 분리)
-:app:worker              // outbox-relay, order-dispatcher, ingestion, 만료 스위퍼
-:domain:catalog | :domain:checkout | :domain:order   // 순수 Kotlin, 프레임워크 의존 없음
-:adapter:pg-toss | :adapter:pg-portone | :adapter:pg-stripe
-:adapter:oms-cafe24 | :adapter:oms-godomall | :adapter:oms-shopify | :adapter:oms-webhook
-:infra:persistence (jOOQ) | :infra:messaging (SQS) | :infra:crypto (KMS envelope)
+apps/agent-gateway       // API 진입점, 프로토콜 어댑터(REST/ACP/MCP)
+apps/webhook-receiver    // 퍼블릭 엔드포인트 분리 (공격면/스케일 분리)
+apps/worker              // outbox-relay, order-dispatcher, ingestion, 만료 스위퍼, 리컨실리에이션
+apps/merchant-console    // Next.js (App Router) — 가맹점 온보딩/검수/주문 조회
+packages/domain-catalog | domain-checkout | domain-order   // 순수 TS, 프레임워크/DB 의존 없음
+packages/adapter-pg-{toss,portone,stripe}
+packages/adapter-oms-{cafe24,godomall,shopify,webhook}
+packages/infra-db (Kysely) | infra-messaging (SQS) | infra-crypto (KMS envelope)
+packages/contracts       // zod 스키마 → OpenAPI / MCP tool / 콘솔 타입 공유
 ```
 - 도메인 포트 예: `PaymentGateway.createPayment / inquire / cancel`, `OrderManagementSystem.pushOrder / fetchInventory`.
-- 영속성은 jOOQ 권장: 조건부 UPDATE(재고), `FOR UPDATE SKIP LOCKED`(디스패치 큐), pgvector 연산자 등 SQL 제어가 핵심이라 JPA보다 적합.
+- **Node 특유 주의점**
+  - **금액 BIGINT**: `pg` 드라이버는 `int8`을 문자열로 반환. `Money` 값 객체는 내부적으로 `bigint`를 쓰고 JSON 직렬화 시 `Number.isSafeInteger` 검증 후 number로 내보낸다(KRW는 2^53 한도 내). `parseFloat`/`Number()` 직접 캐스팅 금지 — lint 룰로 차단.
+  - **이벤트 루프 블로킹**: 대용량 XLSX 파싱·HTML 정제는 worker_threads 또는 별도 워커 Pod에서만. API Pod은 `event loop lag` 메트릭 알람.
+  - **장애 격리**: PG/OMS 호출은 `undici` 타임아웃 + `opossum` 서킷브레이커 + 커넥션풀 상한을 어댑터별로 분리(한 PG 장애가 전체 소켓 풀을 잠식하지 않도록).
 
 ## 3. 핵심 플로우
 
@@ -160,7 +167,7 @@ Agent              Gateway(checkout)            DB                 PG           
 
 | 장애 시나리오 | 대응 |
 |---|---|
-| PG 장애 | 결제 페이지에서 장애 PG 차단, 가맹점에 보조 MID 있으면 failover. Circuit Breaker(Resilience4j). |
+| PG 장애 | 결제 페이지에서 장애 PG 차단, 가맹점에 보조 MID 있으면 failover. Circuit Breaker(opossum). |
 | 웹훅 유실 | 리컨실리에이션 배치: `PAYMENT_PENDING` 세션을 5분 주기로 PG 조회 → 승인 건 처리. **웹훅은 최적화일 뿐 정합성 근거는 PG 조회.** |
 | OMS 장애/토큰 만료 | 디스패치 재시도 + `merchant_oms_connections.status=AUTH_EXPIRED` → 가맹점 알림. 장시간 실패 시 해당 가맹점 `checkout_enabled` 자동 OFF (결제는 됐는데 주문이 안 들어가는 상황 확산 방지). |
 | OMS 품절 거절 | 자동 PG 전액 취소 + 에이전트/구매자 통지. 취소 실패는 DLQ + 수동 처리 대시보드. |
