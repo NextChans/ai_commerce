@@ -138,7 +138,7 @@ AI 에이전트가 호출하는 **상품 검색 API**와 **결제 세션 생성 
 ## 2. 결제 세션 생성 API
 
 ### `POST /v1/checkout-sessions`
-에이전트가 구매를 결정하면 호출. 플랫폼은 **서버측으로 가격을 재계산**하고, 재고를 홀드한 뒤 사용자가 승인할 **1회성 결제 URL**을 반환한다. 이 시점엔 PG 호출이 없다(PG 결제창은 사용자가 URL을 열 때 생성).
+에이전트가 구매를 결정하면 호출. 결제는 **플랫폼 MID**(Toss Payments 또는 KG이니시스)로 이루어지므로 **여러 하위몰 상품을 한 세션에 담을 수 있다**(통합결제). 플랫폼은 **서버측으로 가격을 재계산**하고, 재고를 홀드한 뒤 사용자가 승인할 **1회성 결제 URL**을 반환한다. 이 시점엔 PG 호출이 없다(PG 결제창은 사용자가 URL을 열 때 생성).
 
 **Headers**
 ```
@@ -150,12 +150,16 @@ Content-Type: application/json
 **Request**
 ```json
 {
-  "merchant_id": "mch_01J9…",
   "line_items": [
     {
       "variant_id": "var_01J9Z8X4…",
       "quantity": 1,
       "expected_unit_price": { "amount": 289000, "currency": "KRW" }
+    },
+    {
+      "variant_id": "var_01J9ZC7Q…",
+      "quantity": 2,
+      "expected_unit_price": { "amount": 24900, "currency": "KRW" }
     }
   ],
   "buyer": {
@@ -185,8 +189,7 @@ Content-Type: application/json
 
 | 필드 | 필수 | 검증 |
 |---|---|---|
-| `merchant_id` | Y | `merchant_agent_policies.checkout_enabled = true` |
-| `line_items[]` | Y | 1–20개, 모두 동일 가맹점 variant, variant 중복 불가 |
+| `line_items[]` | Y | 1–20개, variant 중복 불가. 하위몰 최대 5곳. 각 하위몰은 `merchant_agent_policies.checkout_enabled = true` 이고 정산 프로필 `kyc_status = APPROVED` 여야 함. 하나라도 위반하면 세션 전체를 거부(원자성), 위반 variant는 `detail`/`invalid_items`로 반환 |
 | `line_items[].quantity` | Y | 1–99 |
 | `line_items[].expected_unit_price` | Y | 서버 현재가와 다르면 `409 PRICE_CHANGED` (에이전트가 사용자에게 보여준 가격 = 결제 가격 보장) |
 | `buyer` | N | 생략 시 결제 페이지에서 사용자가 직접 입력 (PII 최소 수집 원칙상 권장) |
@@ -199,41 +202,70 @@ Content-Type: application/json
 {
   "id": "cs_01J9ZA0M2…",
   "status": "OPEN",
-  "merchant_id": "mch_01J9…",
-  "line_items": [
+  "merchant_groups": [
     {
-      "variant_id": "var_01J9Z8X4…",
-      "title": "모던 화이트 수납 침대 프레임 Q",
-      "options": { "color": "화이트", "bed_size": "Q" },
-      "quantity": 1,
-      "unit_price": { "amount": 289000, "currency": "KRW" },
-      "line_total": { "amount": 289000, "currency": "KRW" }
+      "merchant": { "id": "mch_01J9…", "name": "하우스퍼니처" },
+      "line_items": [
+        {
+          "variant_id": "var_01J9Z8X4…",
+          "title": "모던 화이트 수납 침대 프레임 Q",
+          "options": { "color": "화이트", "bed_size": "Q" },
+          "quantity": 1,
+          "unit_price": { "amount": 289000, "currency": "KRW" },
+          "line_total": { "amount": 289000, "currency": "KRW" }
+        }
+      ],
+      "shipping": { "amount": 0, "currency": "KRW" },
+      "total":    { "amount": 289000, "currency": "KRW" }
+    },
+    {
+      "merchant": { "id": "mch_01J9K…", "name": "리빙소품샵" },
+      "line_items": [
+        {
+          "variant_id": "var_01J9ZC7Q…",
+          "title": "린넨 베개커버 50x70",
+          "options": { "color": "오트밀" },
+          "quantity": 2,
+          "unit_price": { "amount": 24900, "currency": "KRW" },
+          "line_total": { "amount": 49800, "currency": "KRW" }
+        }
+      ],
+      "shipping": { "amount": 3000, "currency": "KRW" },
+      "total":    { "amount": 52800, "currency": "KRW" }
     }
   ],
   "totals": {
-    "subtotal": { "amount": 289000, "currency": "KRW" },
-    "shipping": { "amount": 0, "currency": "KRW" },
+    "subtotal": { "amount": 338800, "currency": "KRW" },
+    "shipping": { "amount": 3000, "currency": "KRW" },
     "discount": { "amount": 0, "currency": "KRW" },
-    "total":    { "amount": 289000, "currency": "KRW" }
+    "total":    { "amount": 341800, "currency": "KRW" }
   },
   "checkout_url": "https://pay.{domain}/c/Zk3n…(43 chars)…",
   "expires_at": "2026-10-07T03:30:00Z",
   "inventory_hold": { "held": true, "expires_at": "2026-10-07T03:30:00Z" },
   "payment_methods": ["CARD", "EASY_PAY", "TRANSFER"],
-  "agent_hint": "Show checkout_url to the user. Payment must be approved by the user within 30 minutes. Poll GET /v1/checkout-sessions/{id} or subscribe to webhooks for the result."
+  "agent_hint": "Show checkout_url to the user. One payment covers all merchants; items ship separately per merchant. Payment must be approved within 30 minutes. Poll GET /v1/checkout-sessions/{id} or subscribe to webhooks for the result."
 }
 ```
+- 배송비는 하위몰별로 계산된다(묶음배송 단위 = 하위몰). `merchant_groups[].total`의 합 = `totals.total`.
+- 결제 페이지에는 하위몰별 판매자 정보(상호·사업자번호·통신판매업 신고번호)와 "플랫폼은 통신판매중개자" 고지를 표시한다(전자상거래법).
 - `checkout_url`은 **이 응답에서 단 한 번만** 원문으로 반환된다(서버는 해시만 저장). 같은 `Idempotency-Key` 재시도 시에는 멱등 응답 캐시에서 재생.
 - 기본 TTL 30분 (가맹점 정책으로 10–60분 조정).
 
 ### `GET /v1/checkout-sessions/{id}`
-상태 폴링. `checkout_url` 은 반환하지 않음. 권장 폴링 간격 5s 이상, 대신 에이전트 웹훅(`checkout.completed`, `order.accepted`, `order.refunded`) 구독 권장.
+상태 폴링. `checkout_url` 은 반환하지 않음. 하위몰별 주문 상태가 따로 움직이므로(위 예시: 한 곳은 품절 거절 → 부분환불) 에이전트는 `orders[]` 단위로 사용자에게 안내해야 한다. 권장 폴링 간격 5s 이상, 대신 에이전트 웹훅(`checkout.completed`, `order.accepted`, `order.refunded`) 구독 권장.
 ```json
 {
   "id": "cs_01J9ZA0M2…",
   "status": "COMPLETED",
-  "totals": { "total": { "amount": 289000, "currency": "KRW" } },
-  "order": { "id": "ord_01J9ZB…", "status": "ACCEPTED", "merchant_order_ref": "20261007-0001234" },
+  "totals": { "total": { "amount": 341800, "currency": "KRW" } },
+  "payment": { "pg_provider": "TOSS", "method": "CARD", "approved_amount": { "amount": 341800, "currency": "KRW" } },
+  "orders": [
+    { "id": "ord_01J9ZB…", "merchant_id": "mch_01J9…",  "status": "ACCEPTED", "merchant_order_ref": "20261007-0001234",
+      "total": { "amount": 289000, "currency": "KRW" }, "refunded": { "amount": 0, "currency": "KRW" } },
+    { "id": "ord_01J9ZC…", "merchant_id": "mch_01J9K…", "status": "REJECTED", "merchant_order_ref": null,
+      "total": { "amount": 52800, "currency": "KRW" },  "refunded": { "amount": 52800, "currency": "KRW" } }
+  ],
   "expires_at": "2026-10-07T03:30:00Z",
   "completed_at": "2026-10-07T03:04:51Z"
 }
@@ -252,22 +284,26 @@ async function createCheckoutSession(cmd: CreateCheckoutCommand): Promise<Checko
   const claimed = await idempotency.claim(cmd.agentId, cmd.idempotencyKey, cmd.requestHash); // INSERT ON CONFLICT
   if (claimed.kind === 'replay') return claimed.response;          // 완료 응답 재생 (처리중 409 / 바디 상이 422 는 throw)
 
-  const policy = await policyRepo.get(cmd.merchantId, cmd.agentId);
-  policy.requireCheckoutEnabled();                                  // 403 MERCHANT_NOT_AVAILABLE
-
   try {
     const result = await db.transaction().execute(async (trx) => {
-      const variants = await variantRepo.findActive(trx, cmd.merchantId, cmd.variantIds); // 동일 가맹점/ACTIVE 검증
-      const quote = pricing.quote(variants, cmd.lineItems, cmd.shipping);                  // 서버측 재계산 (bigint)
+      const variants = await variantRepo.findActive(trx, cmd.variantIds);          // ACTIVE 검증
+      const groups = groupByMerchant(variants, cmd.lineItems);                     // 하위몰 ≤ 5
+      const policies = await policyRepo.getMany(trx, groups.merchantIds, cmd.agentId);
+      policies.requireCheckoutEnabledAndKycApproved();              // 403 MERCHANT_NOT_AVAILABLE (+ invalid_items)
+
+      const quote = pricing.quote(groups, cmd.shipping);            // 하위몰별 소계/배송비 서버측 재계산 (bigint)
       quote.assertMatches(cmd.expectedPrices);                      // 409 PRICE_CHANGED
-      policy.assertWithinLimit(quote.total);                        // 422 ORDER_LIMIT_EXCEEDED
+      policies.assertWithinLimit(quote);                            // 422 ORDER_LIMIT_EXCEEDED (하위몰별 한도)
 
       for (const item of [...cmd.lineItems].sort(byVariantId)) {    // 데드락 방지: 고정 순서로 락
         await inventory.hold(trx, item.variantId, item.quantity);   // 조건부 UPDATE, 0 row → 409 OUT_OF_STOCK
       }
 
       const token = CheckoutToken.generate();                       // crypto.randomBytes(32), DB엔 sha256만
-      const session = await sessionRepo.insert(trx, { quote, cmd, tokenHash: token.hash, ttl: policy.ttl });
+      const pgAccount = await pgRouter.pickPrimary(trx, quote.currency);           // Toss/이니시스 중 활성 primary
+      const session = await sessionRepo.insert(trx, {                 // sessions + session_merchants + items
+        quote, cmd, pgAccount, tokenHash: token.hash, ttl: policies.minTtl,
+      });
       return { session, checkoutUrl: token.toUrl() };
     });
     await idempotency.complete(cmd, 201, result);
@@ -285,4 +321,5 @@ async function createCheckoutSession(cmd: CreateCheckoutCommand): Promise<Checko
 2. **PII를 에이전트가 전달하는 경로**: 에이전트 플랫폼이 사용자 주소를 보유한 경우 편의성이 크지만, 개인정보 수집 주체·제3자 제공 고지가 복잡해진다. MVP는 *선택 필드*로 두고 결제 페이지에서 동의와 함께 최종 확정.
 3. **재고 홀드 남용**: 악성/버그 에이전트가 세션을 대량 생성해 재고를 묶을 수 있음 → 에이전트별 `OPEN` 세션 수 상한, variant별 1세션 최대 홀드 수량, 미결제율 모니터링.
 4. **검색 API 스크래핑**: 경쟁사 가격 수집 악용 가능 → 에이전트 계약 기반 발급, 레이트리밋 티어, `available_quantity` 상한 노출.
-5. 다음 단계로 이 명세를 OpenAPI 3.1 로 옮겨 계약 테스트(schemathesis)와 MCP tool 정의를 자동 생성하는 것을 권장. `packages/contracts`의 zod 스키마를 단일 소스로 둔다.
+5. **통합결제의 부분 실패 UX**: 하위몰 A는 접수, B는 품절 거절 → B만 부분환불. 결제수단별 부분취소 제약(가상계좌 환불계좌 수집 등)을 결제 페이지에서 미리 안내해야 합니다.
+6. 다음 단계로 이 명세를 OpenAPI 3.1 로 옮겨 계약 테스트(schemathesis)와 MCP tool 정의를 자동 생성하는 것을 권장. `packages/contracts`의 zod 스키마를 단일 소스로 둔다.

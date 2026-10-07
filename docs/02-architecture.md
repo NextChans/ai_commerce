@@ -30,15 +30,15 @@
 │ ┌──────────────────────────────── agent-gateway (NestJS/Fastify) ──────────────────────────┐ │
 │ │  [Edge]  AuthN/Z(scope) · Rate Limit(Redis) · Idempotency · Request Signing · Audit       │ │
 │ │  [Protocol Adapters]  REST v1  │  ACP adapter  │  MCP server (tools: search, checkout)    │ │
-│ │ ┌───────────────┐  ┌────────────────────┐  ┌──────────────────────┐                      │ │
-│ │ │ catalog       │  │ checkout           │  │ order                │                      │ │
-│ │ │ - HybridSearch│  │ - Quote/Pricing    │  │ - OrderStateMachine  │                      │ │
-│ │ │ - ProductQuery│  │ - InventoryHold    │  │ - RefundPolicy       │                      │ │
-│ │ │ - JSON-LD     │  │ - PgBridge(port)   │  │ - OmsRouter(port)    │                      │ │
-│ │ └──────┬────────┘  └────────┬───────────┘  └──────────┬───────────┘                      │ │
+│ │ ┌───────────────┐  ┌────────────────────┐  ┌──────────────────────┐ ┌─────────────────┐  │ │
+│ │ │ catalog       │  │ checkout           │  │ order                │ │ settlement      │  │ │
+│ │ │ - HybridSearch│  │ - Quote/Pricing    │  │ - OrderStateMachine  │ │ - Ledger(복식)  │  │ │
+│ │ │ - ProductQuery│  │ - InventoryHold    │  │ - RefundPolicy       │ │ - FeeCalculator │  │ │
+│ │ │ - JSON-LD     │  │ - PgBridge(port)   │  │ - OmsRouter(port)    │ │ - PayoutGateway │  │ │
+│ │ └──────┬────────┘  └────────┬───────────┘  └──────────┬───────────┘ └───────┬─────────┘  │ │
 │ │        │       ┌────────────┴───────────┐             │                                  │ │
 │ │        │       │ PG Adapters            │             │  OMS Adapters                    │ │
-│ │        │       │ Toss / PortOne / Stripe│             │  Cafe24 / Godomall / Shopify /…  │ │
+│ │        │       │ Toss / KG이니시스      │             │  Cafe24 / Godomall / Shopify /…  │ │
 │ └────────┼───────┴────────────┬───────────┴─────────────┼──────────────────────────────────┘ │
 │          │                    │                         │                                    │
 │ ┌────────┴─────────┐ ┌────────┴──────────┐ ┌────────────┴──────────┐ ┌──────────────────┐   │
@@ -72,13 +72,14 @@ apps/agent-gateway       // API 진입점, 프로토콜 어댑터(REST/ACP/MCP)
 apps/webhook-receiver    // 퍼블릭 엔드포인트 분리 (공격면/스케일 분리)
 apps/worker              // outbox-relay, order-dispatcher, ingestion, 만료 스위퍼, 리컨실리에이션
 apps/merchant-console    // Next.js (App Router) — 가맹점 온보딩/검수/주문 조회
-packages/domain-catalog | domain-checkout | domain-order   // 순수 TS, 프레임워크/DB 의존 없음
-packages/adapter-pg-{toss,portone,stripe}
+packages/domain-catalog | domain-checkout | domain-order | domain-settlement   // 순수 TS, 프레임워크/DB 의존 없음
+packages/adapter-pg-{toss,inicis}          // 결제 승인/조회/취소 + 지급대행(PayoutGateway)
+packages/adapter-payout-firmbanking        // DIRECT_BANK 채널 (Phase 2)
 packages/adapter-oms-{cafe24,godomall,shopify,webhook}
 packages/infra-db (Kysely) | infra-messaging (SQS) | infra-crypto (KMS envelope)
 packages/contracts       // zod 스키마 → OpenAPI / MCP tool / 콘솔 타입 공유
 ```
-- 도메인 포트 예: `PaymentGateway.createPayment / inquire / cancel`, `OrderManagementSystem.pushOrder / fetchInventory`.
+- 도메인 포트 예: `PaymentGateway.createPayment / inquire / cancel(partial)`, `PayoutGateway.registerPayee / requestPayout / getPayout / getBalance`, `OrderManagementSystem.pushOrder / fetchInventory`.
 - **Node 특유 주의점**
   - **금액 BIGINT**: `pg` 드라이버는 `int8`을 문자열로 반환. `Money` 값 객체는 내부적으로 `bigint`를 쓰고 JSON 직렬화 시 `Number.isSafeInteger` 검증 후 number로 내보낸다(KRW는 2^53 한도 내). `parseFloat`/`Number()` 직접 캐스팅 금지 — lint 룰로 차단.
   - **이벤트 루프 블로킹**: 대용량 XLSX 파싱·HTML 정제는 worker_threads 또는 별도 워커 Pod에서만. API Pod은 `event loop lag` 메트릭 알람.
@@ -133,11 +134,14 @@ Agent              Gateway(checkout)            DB                 PG           
   │                   │ 9. 비동기: PG 조회 API로 상태/금액 재확인 (웹훅 바디 불신)          
   │                   │10. TX{ amount == session.total 검증, payment INSERT,                
   │                   │        session COMPLETED, reservation CONSUMED,                    
-  │                   │        order/items INSERT, outbox(order.created) }                 
+  │                   │        하위몰별 order/items N건 INSERT,                            
+  │                   │        settlement_items(SALE, PENDING) N건 + 원장 ORDER_SALE 분개, 
+  │                   │        outbox(order.created × N) }                                 
   │                   │11. outbox-relay → SQS order-dispatch.fifo                          
-  │                   │12. order-dispatcher → OMS pushOrder (멱등키 = order.id)             
+  │                   │12. order-dispatcher → 하위몰 OMS pushOrder (멱등키 = order.id)      
   │                   │      성공: merchant_order_ref 저장, ACCEPTED                       
-  │                   │      품절/거절: REJECTED → PG 취소 → REFUNDED                       
+  │                   │      품절/거절: REJECTED → 해당 주문 금액만 PG 부분취소 → 원장 역분개
+  │                   │13. 배송완료 → 구매확정 → 정산 배치 → 하위몰 지급 (04-settlement.md)
   │                   │      일시 오류: 지수 백오프(1m,5m,15m,1h…) → N회 후 DEAD + 알람       
   │◀── (옵션) 에이전트 웹훅: order.accepted / order.shipped / order.refunded               
 ```
@@ -148,7 +152,7 @@ Agent              Gateway(checkout)            DB                 PG           
 
 ## 4. 규제·보안 아키텍처 (금융 도메인)
 
-1. **자금 비보유 구조 (가장 중요)**: 결제는 *가맹점 자신의 PG MID*로 승인되고 정산도 PG → 가맹점으로 직접 이뤄진다. 플랫폼이 대금을 수취해 재지급하면 전자금융거래법상 **PG업(전자지급결제대행업) 등록** 대상이 될 수 있다. 플랫폼 수수료는 별도 청구(월 인보이스)하거나 PG의 지급대행/분할정산 기능(PG가 등록업자로 수행)을 활용 — **법무 검토 필수 항목**.
+1. **플랫폼 수취 → 하위몰 정산 구조 (가장 중요)**: 플랫폼 MID(Toss/이니시스)로 결제를 받고 하위몰에 정산합니다. 개정 전자금융거래법(**2026-12-17 시행**)은 통신판매중개에 부수한 정산을 PG업에서 제외하지만, 시행 전에는 **PG 지급대행(대금은 PG 보관)**으로 운영하고, 시행 후 법률의견을 받아 자체 정산(`DIRECT_BANK`)으로 전환합니다. 정산 전용 계좌 분리, 복식부기 원장, 일일 대사를 기본으로 둡니다. 상세는 [04-settlement.md](04-settlement.md).
 2. **카드정보 비취급**: 카드번호는 PG 결제창/SDK에서만 입력 → 플랫폼은 PCI-DSS 범위 밖(SAQ-A 수준) 유지. 우리 호스티드 페이지에서 카드 입력 필드를 직접 렌더링하지 않는다.
 3. **개인정보**: 구매자 정보는 가맹점에 *제3자 제공*되므로 결제 페이지에서 동의 수집, 증적은 `checkout_sessions.buyer_consent`. 보관기한(전자상거래법: 계약·대금결제 기록 5년) 경과 시 파기 배치.
 4. **에이전트 인증**: OAuth2 client_credentials + `private_key_jwt`(또는 mTLS). Access token 5분 TTL, scope: `catalog:read`, `checkout:write`, `orders:read`.
@@ -167,7 +171,8 @@ Agent              Gateway(checkout)            DB                 PG           
 
 | 장애 시나리오 | 대응 |
 |---|---|
-| PG 장애 | 결제 페이지에서 장애 PG 차단, 가맹점에 보조 MID 있으면 failover. Circuit Breaker(opossum). |
+| PG 장애 | 플랫폼이 Toss·이니시스 MID를 모두 보유하므로 결제 페이지에서 장애 PG를 차단하고 다른 PG로 failover. Circuit Breaker(opossum). |
+| 정산·지급 이상 | 원장 불변식 위반(지급 의무 > 보유 자금) 시 지급 자동 중단 + P1 알람. 지급 타임아웃은 같은 멱등키로만 재조회. |
 | 웹훅 유실 | 리컨실리에이션 배치: `PAYMENT_PENDING` 세션을 5분 주기로 PG 조회 → 승인 건 처리. **웹훅은 최적화일 뿐 정합성 근거는 PG 조회.** |
 | OMS 장애/토큰 만료 | 디스패치 재시도 + `merchant_oms_connections.status=AUTH_EXPIRED` → 가맹점 알림. 장시간 실패 시 해당 가맹점 `checkout_enabled` 자동 OFF (결제는 됐는데 주문이 안 들어가는 상황 확산 방지). |
 | OMS 품절 거절 | 자동 PG 전액 취소 + 에이전트/구매자 통지. 취소 실패는 DLQ + 수동 처리 대시보드. |
@@ -176,7 +181,7 @@ Agent              Gateway(checkout)            DB                 PG           
 
 ## 6. 오픈 이슈 (의사결정 필요)
 
-1. 플랫폼 수수료 수취 방식 (별도 청구 vs PG 분할정산) — 법무/재무 검토.
-2. 1차 지원 PG: 국내 가맹점 기준 Toss Payments + PortOne(멀티 PG 흡수) 우선, Stripe는 해외 가맹점 확장 시.
+1. 자체 정산(`DIRECT_BANK`) 전환 시점과 "부수적 정산" 요건 충족 여부 — 법무 검토. 판매대금 정산기한·별도관리 등 다른 법령 의무 확인.
+2. PG: **Toss Payments + KG이니시스**로 확정 (PortOne·Stripe 미사용). 두 PG의 지급대행 계약 조건(수수료, 지급 주기, 잔액 운용)을 비교해야 합니다.
 3. 1차 지원 OMS: 카페24(점유율)·고도몰 우선. 나머지는 `CUSTOM_WEBHOOK` 표준 스펙으로 흡수.
 4. 프로토콜: 자체 REST를 정본으로 두고 ACP / MCP 는 어댑터 레이어. 스펙 변화 속도가 빨라 도메인 모델에 프로토콜 필드를 직접 섞지 않는다.
